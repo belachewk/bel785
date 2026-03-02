@@ -1,0 +1,405 @@
+import re
+import datetime
+import os
+import tkinter as tk
+import customtkinter as ctk
+from tkinter import filedialog, messagebox, ttk
+import pdfplumber
+import pandas as pd
+from fpdf import FPDF, XPos, YPos
+
+# Constants
+AUTHOR_NAME = "Developed By Belachew Kebede Eshetu"
+
+class AdvancedExtractor:
+    def __init__(self):
+        self.date_pattern = r'(\d{1,2}[-/ ]\d{1,2}[-/ ]\d{2,4})'
+
+    def clean_amounts(self, text):
+        """Fixes Ledger space issue: e.g., '1227054980 72' -> 1227054980.72"""
+        text = re.sub(r'([\d,]+)\s+(\d{2})\b', r'\1.\2', text)
+        matches = re.findall(r'-?[\d,]*\.\d{2}', text)
+        floats = []
+        for m in matches:
+            try:
+                clean_str = m.replace(',', '').strip()
+                if clean_str in ['.00', '-.00']:
+                    floats.append(0.0)
+                else:
+                    floats.append(float(clean_str))
+            except:
+                pass
+        return floats
+
+    def extract(self, path, is_ledger):
+        data = []
+        final_bal = 0.0
+        current_eth_dt = ""
+        current_gc_dt = ""
+
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text(layout=True)
+                if not text:
+                    continue
+
+                lines = text.split('\n')
+                for line in lines:
+                    try:
+                        date_match = re.search(self.date_pattern, line)
+                        if date_match:
+                            date_str = date_match.group(1)
+                            idx = line.find(date_str)
+                            content = line[idx + len(date_str):]
+
+                            # Parse dates
+                            p = [x for x in re.split(r'[-/ ]', date_str) if x]
+                            day = int(p[0]) if len(p[0]) <= 2 else int(p[2])
+                            year = int(p[2]) if len(p[2]) == 4 else int(p[0])
+                            month = int(p[1])
+
+                            safe_m = max(1, min(12, month))
+                            safe_d = max(1, min(28, day))
+                            try:
+                                dt = datetime.date(year, safe_m, safe_d)
+                            except:
+                                dt = datetime.date.today()
+
+                            orig_str = f"{day:02d}/{month:02d}/{year}"
+                            if is_ledger:
+                                current_eth_dt = orig_str
+                                current_gc_dt = (dt + datetime.timedelta(days=2796)).strftime("%d/%m/%Y")
+                            else:
+                                current_gc_dt = orig_str
+                                current_eth_dt = (dt - datetime.timedelta(days=2796)).strftime("%d/%m/%Y")
+                        else:
+                            # Handling lines without dates (Balance carry forwards)
+                            if "BALANCE" in line.upper() or "C/F" in line.upper():
+                                amts = self.clean_amounts(line)
+                                if amts:
+                                    final_bal = abs(amts[-1])
+                                continue
+                            if not current_eth_dt:
+                                continue
+                            content = line
+
+                        if is_ledger:
+                            amounts = self.clean_amounts(content)
+                            if not amounts:
+                                continue
+
+                            val = 0.0
+                            t_type = "UNKNOWN"
+                            line_up = line.upper()
+
+                            if len(amounts) >= 2 and not any(k in line_up for k in ["DR", "CR", "RECEIPT", "PAYMENT"]):
+                                if abs(amounts[0]) > 0 and abs(amounts[1]) == 0:
+                                    val, t_type = abs(amounts[0]), "DEBIT"
+                                elif abs(amounts[0]) == 0 and abs(amounts[1]) > 0:
+                                    val, t_type = abs(amounts[1]), "CREDIT"
+                                else:
+                                    val, t_type = abs(amounts[0]), "DEBIT"
+                            else:
+                                val = abs(amounts[0])
+                                if any(k in line_up for k in ["RECEIPT", "DR"]):
+                                    t_type = "DEBIT"
+                                elif any(k in line_up for k in ["PAYMENT", "CR"]):
+                                    t_type = "CREDIT"
+                                else:
+                                    t_type = "DEBIT"
+                            if val == 0.0:
+                                continue
+                            final_bal = abs(amounts[-1])
+                        else:
+                            # ----------- BANK LOGIC -----------
+                            number_matches = re.findall(r'-?[\d,]*\.\d{2}', line)
+                            floats = []
+                            for n in number_matches:
+                                floats.append(float(n.replace(',', '')) if n and n != '.00' and n != '-.00' else 0.0)
+
+                            # Print for debugging
+                            print("\n=== DEBUG BANK ROW ===")
+                            print(f"LINE: {line}")
+                            print(f"Extracted floats: {floats}")
+
+                            val = 0.0
+                            t_type = "UNKNOWN"
+                            if len(floats) >= 3:
+                                debit_candidate = floats[-3]
+                                credit_candidate = floats[-2]
+                                balance_candidate = floats[-1]
+                                if abs(debit_candidate) > 0 and abs(credit_candidate) == 0:
+                                    val = abs(debit_candidate)
+                                    t_type = "DEBIT"
+                                elif abs(debit_candidate) == 0 and abs(credit_candidate) > 0:
+                                    val = credit_candidate
+                                    t_type = "CREDIT"
+                                elif debit_candidate < 0:
+                                    val = abs(debit_candidate)
+                                    t_type = "DEBIT"
+                                elif credit_candidate > 0:
+                                    val = credit_candidate
+                                    t_type = "CREDIT"
+                                else:
+                                    continue
+                                final_bal = abs(balance_candidate)
+                            elif len(floats) == 2:
+                                a1, a2 = floats[0], floats[1]
+                                # If first is zero and second is positive (credit), treat as credit
+                                if abs(a1) == 0.0 and abs(a2) > 0.0:
+                                    val = abs(a2)
+                                    t_type = "CREDIT"
+                                    final_bal = abs(a2)
+                                else:
+                                    val = abs(a1)
+                                    t_type = "DEBIT" if a1 < 0 else "CREDIT"
+                                    final_bal = abs(a2)
+                            elif len(floats) == 1:
+                                val = abs(floats[0])
+                                t_type = "DEBIT" if floats[0] < 0 else "CREDIT"
+                                final_bal = abs(floats[0])
+                            else:
+                                continue
+
+                            print(f"Detected Value: {val}, Type: {t_type}, Final Bal: {final_bal}")
+
+                            if val == 0.0:
+                                continue
+
+                        data.append({
+                            "source": "Ledger" if is_ledger else "Bank",
+                            "eth_date": current_eth_dt,
+                            "gc_date": current_gc_dt,
+                            "amount": val,
+                            "type": t_type,
+                            "desc": content[:40].strip()
+                        })
+                    except Exception as e:
+                        print("ERROR parsing line:", line)
+                        print(e)
+                        continue
+
+        return data, final_bal
+
+class ReconApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("SERS Bank Reconciliation System")
+        self.after(0, lambda: self.state('zoomed'))
+
+        self.style = ttk.Style()
+        self.style.theme_use("default")
+        self.style.configure("Treeview.Heading", font=("Helvetica", 12, "bold"), foreground="#1E3A8A")
+        self.style.configure("Treeview", font=("Helvetica", 11), rowheight=28)
+
+        self.extractor = AdvancedExtractor()
+        self.bank_data, self.ledger_data, self.all_results = [], [], []
+        self.bank_bal, self.ledger_bal = 0.0, 0.0
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.header = ctk.CTkFrame(self, fg_color="white", height=100, corner_radius=0)
+        self.header.pack(fill="x")
+        ctk.CTkLabel(self.header, text="SERS BANK RECONCILIATION SYSTEM", font=("Helvetica", 26, "bold"), text_color="#1E3A8A").place(relx=0.5, rely=0.4, anchor="center")
+        ctk.CTkLabel(self.header, text=AUTHOR_NAME, font=("Helvetica", 11, "italic"), text_color="#64748B").place(relx=0.5, rely=0.75, anchor="center")
+
+        self.sidebar = ctk.CTkFrame(self, width=260, corner_radius=0)
+        self.sidebar.pack(side="left", fill="y")
+        ctk.CTkLabel(self.sidebar, text="SOURCE DATA", font=("Helvetica", 16, "bold")).pack(pady=(20, 10))
+        ctk.CTkButton(self.sidebar, text="Load Bank Statement", command=lambda: self.load(False)).pack(pady=(10, 5), padx=20)
+        self.bank_status = ctk.CTkLabel(self.sidebar, text="No bank file", font=("Helvetica", 11), text_color="gray")
+        self.bank_status.pack()
+        ctk.CTkButton(self.sidebar, text="Load Ledger Data", command=lambda: self.load(True)).pack(pady=(10, 5), padx=20)
+        self.ledger_status = ctk.CTkLabel(self.sidebar, text="No ledger file", font=("Helvetica", 11), text_color="gray")
+        self.ledger_status.pack()
+        ctk.CTkButton(self.sidebar, text="RUN RECONCILIATION", fg_color="#1E40AF", height=45, command=self.reconcile).pack(pady=(40, 5), padx=20)
+        ctk.CTkButton(self.sidebar, text="Summary Audit PDF", fg_color="#4F46E5", height=40, command=self.export_summary_pdf).pack(pady=10, padx=20)
+        ctk.CTkButton(self.sidebar, text="Reset System", fg_color="transparent", text_color="#DC2626", hover_color="#FEE2E2", command=self.reset_system).pack(side="bottom", pady=20)
+
+        self.main_view = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_view.pack(side="right", fill="both", expand=True, padx=20, pady=10)
+        self.nav = ctk.CTkSegmentedButton(self.main_view, values=["Bank Statement", "Ledger Data", "Reconciliation Results"], command=self.tab_changed)
+        self.nav.pack(fill="x", pady=(10, 5))
+        self.filter_frame = ctk.CTkFrame(self.main_view, fg_color="transparent")
+        self.filter_menu = ctk.CTkOptionMenu(self.filter_frame, values=["ALL", "MATCHED", "NOT IN BANK", "NOT IN LEDGER"], command=self.apply_filter)
+        self.filter_menu.pack(side="left", padx=10)
+        self.tree_container = ctk.CTkFrame(self.main_view, fg_color="white")
+        self.tree_container.pack(fill="both", expand=True)
+        self.tree_bank = self.create_tree()
+        self.tree_ledger = self.create_tree()
+        self.tree_recon = self.create_tree(is_recon=True)
+        self.show_tree(self.tree_bank)
+
+        self.footer = ctk.CTkFrame(self.main_view, fg_color="transparent")
+        self.footer.pack(fill="x", pady=20)
+        self.btn_container = ctk.CTkFrame(self.footer, fg_color="transparent")
+        self.btn_container.pack(expand=True)
+        ctk.CTkButton(self.btn_container, text="Export Detailed PDF", fg_color="#DC2626", command=self.export_detailed_pdf).pack(side="left", padx=10)
+        ctk.CTkButton(self.btn_container, text="Export EXCEL Report", fg_color="#16A34A", command=self.export_excel).pack(side="left", padx=10)
+
+    def create_tree(self, is_recon=False):
+        cols = ("Ser No", "Source", "Eth Date", "GC Date", "Description", "Amount", "Type", "Status") if is_recon else ("Ser No", "Source", "Eth Date", "GC Date", "Description", "Amount", "Type")
+        tree = ttk.Treeview(self.tree_container, columns=cols, show="headings", style="Treeview")
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, anchor="center", width=120)
+        return tree
+
+    def show_tree(self, tree):
+        for t in [self.tree_bank, self.tree_ledger, self.tree_recon]: t.pack_forget()
+        self.filter_frame.pack_forget()
+        if tree == self.tree_recon: self.filter_frame.pack(fill="x", pady=(0, 10))
+        tree.pack(fill="both", expand=True)
+
+    def tab_changed(self, val):
+        if val == "Bank Statement": self.show_tree(self.tree_bank)
+        elif val == "Ledger Data": self.show_tree(self.tree_ledger)
+        else: self.show_tree(self.tree_recon)
+
+    def reset_system(self):
+        self.bank_data, self.ledger_data, self.all_results = [], [], []
+        self.bank_bal, self.ledger_bal = 0.0, 0.0
+        for tree in [self.tree_bank, self.tree_ledger, self.tree_recon]:
+            for i in tree.get_children(): tree.delete(i)
+        self.bank_status.configure(text="No bank file", text_color="gray")
+        self.ledger_status.configure(text="No ledger file", text_color="gray")
+        self.nav.set("Bank Statement")
+        self.show_tree(self.tree_bank)
+
+    def load(self, is_ledger):
+        path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not path: return
+        data, bal = self.extractor.extract(path, is_ledger)
+
+        if is_ledger:
+            self.ledger_data, self.ledger_bal = data, bal
+            self.ledger_status.configure(text=f"Rows: {len(data)} | Bal: {bal:,.2f}", text_color="#16A34A")
+            self.fill_tree(self.tree_ledger, self.ledger_data)
+        else:
+            self.bank_data, self.bank_bal = data, bal
+            self.bank_status.configure(text=f"Rows: {len(data)} | Bal: {bal:,.2f}", text_color="#16A34A")
+            self.fill_tree(self.tree_bank, self.bank_data)
+
+    def fill_tree(self, tree, data):
+        for i in tree.get_children(): tree.delete(i)
+        for idx, d in enumerate(data, 1):
+            tree.insert("", "end", values=(idx, d['source'], d['eth_date'], d['gc_date'], d['desc'], f"{d['amount']:,.2f}", d['type']))
+
+    def reconcile(self):
+        if not self.bank_data or not self.ledger_data:
+            messagebox.showwarning("Missing Data", "Please load both Bank and Ledger files.")
+            return
+
+        self.all_results = []
+        matched_ledger = set()
+
+        # HINT: To improve matching, include other criteria (date, desc)
+        for b in self.bank_data:
+            match = next((i for i, l in enumerate(self.ledger_data) if i not in matched_ledger and abs(b['amount']-l['amount']) < 0.1), None)
+            status = "MATCHED" if match is not None else "NOT IN LEDGER"
+            if match is not None: matched_ledger.add(match)
+            self.all_results.append((b['source'], b['eth_date'], b['gc_date'], b['desc'], b['amount'], b['type'], status))
+
+        for i, l in enumerate(self.ledger_data):
+            if i not in matched_ledger:
+                self.all_results.append((l['source'], l['eth_date'], l['gc_date'], l['desc'], l['amount'], l['type'], "NOT IN BANK"))
+
+        self.apply_filter("ALL")
+        self.nav.set("Reconciliation Results")
+        self.show_tree(self.tree_recon)
+
+    def apply_filter(self, choice):
+        for i in self.tree_recon.get_children(): self.tree_recon.delete(i)
+        count = 1
+        for r in self.all_results:
+            if choice == "ALL" or r[6] == choice:
+                self.tree_recon.insert("", "end", values=(count, r[0], r[1], r[2], r[3], f"{r[4]:,.2f}", r[5], r[6]))
+                count += 1
+
+    def export_summary_pdf(self):
+        if not self.all_results: return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf")
+        if not path: return
+
+        nib = [r for r in self.all_results if r[6] == "NOT IN BANK"]
+        nil = [r for r in self.all_results if r[6] == "NOT IN LEDGER"]
+
+        print("\nBank closing balance used:", self.bank_bal)
+        print("Ledger closing balance used:", self.ledger_bal)
+        print("\nItems not in BANK:")
+        for r in nib:
+            print(r)
+        print("\nItems not in LEDGER:")
+        for r in nil:
+            print(r)
+
+        bank_debit = sum(r[4] for r in nib if r[5] == "DEBIT")
+        bank_credit = sum(r[4] for r in nib if r[5] == "CREDIT")
+        adj_bank = self.bank_bal + bank_debit - bank_credit
+
+        ledger_debit = sum(r[4] for r in nil if r[5] == "DEBIT")
+        ledger_credit = sum(r[4] for r in nil if r[5] == "CREDIT")
+        adj_ledger = self.ledger_bal + ledger_debit - ledger_credit
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("helvetica", 'B', 16)
+        pdf.cell(0, 15, "SUMMARIZED RECONCILIATION REPORT", align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        def add_section(title, last_amt, deb, cre, adj, source):
+            pdf.ln(5)
+            pdf.set_font("helvetica", 'B', 12)
+            pdf.set_fill_color(240, 240, 240)
+            pdf.cell(0, 10, f" {title}", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("helvetica", '', 11)
+            pdf.cell(140, 10, f"Last Balance as per {source} statement", border=1)
+            pdf.cell(50, 10, f"{last_amt:,.2f}", border=1, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(140, 10, f"Add: Items not in {source} (Debit)", border=1)
+            pdf.cell(50, 10, f"{deb:,.2f}", border=1, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(140, 10, f"Less: Items not in {source} (Credit)", border=1)
+            pdf.cell(50, 10, f"{cre:,.2f}", border=1, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("helvetica", 'B', 11)
+            pdf.cell(140, 10, f"ADJUSTED BALANCE", border=1)
+            pdf.cell(50, 10, f"{adj:,.2f}", border=1, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        add_section("Bank Statement Reconciliation", self.bank_bal, bank_debit, bank_credit, adj_bank, "Bank")
+        add_section("Ledger Statement Reconciliation", self.ledger_bal, ledger_debit, ledger_credit, adj_ledger, "Ledger")
+
+        pdf.output(path)
+        messagebox.showinfo("Success", "Summary Audit PDF Generated.")
+
+    def export_detailed_pdf(self):
+        rows = [self.tree_recon.item(i)['values'] for i in self.tree_recon.get_children()]
+        if not rows: return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf")
+        if not path: return
+
+        pdf = FPDF(orientation='L', unit='mm', format='A4')
+        pdf.add_page()
+        pdf.set_font("helvetica", 'B', 16)
+        pdf.cell(0, 15, "SERS DETAILED RECONCILIATION AUDIT REPORT", align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        cols = [("Ser No", 15), ("Source", 25), ("Eth Date", 25), ("GC Date", 25), ("Description", 85), ("Amount", 35), ("Type", 25), ("Status", 35)]
+        pdf.set_font("helvetica", 'B', 10)
+        pdf.set_fill_color(230, 230, 230)
+        for name, width in cols: pdf.cell(width, 10, name, border=1, align='C', fill=True)
+        pdf.ln()
+
+        pdf.set_font("helvetica", '', 9)
+        for r in rows:
+            for i, v in enumerate(r): pdf.cell(cols[i][1], 8, str(v), border=1, align='C' if i != 4 else 'L')
+            pdf.ln()
+        pdf.output(path)
+
+    def export_excel(self):
+        rows = [self.tree_recon.item(i)['values'] for i in self.tree_recon.get_children()]
+        if not rows: return
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx")
+        if not path: return
+        df = pd.DataFrame(rows, columns=["Ser No", "Source", "Eth Date", "GC Date", "Description", "Amount", "Type", "Status"])
+        df.to_excel(path, index=False)
+        messagebox.showinfo("Success", "Excel Report Saved.")
+
+if __name__ == "__main__":
+    app = ReconApp()
+    app.mainloop()
